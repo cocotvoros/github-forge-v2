@@ -8,6 +8,7 @@
 //   * receive-pack validates fast-forward per ref (reason exactly "non-fast-forward"), still
 //     answers "unpack ok", and applies the acceptable refs of a mixed push.
 
+import { createHash } from 'node:crypto';
 import {
   PKT_FLUSH, ZERO_OID, collectReachable, decodePktLines, hashObject, isAncestor, isOid,
   parseCommit, parseTag, parseTree, pktLine, readPack, writePack, type GitObject,
@@ -22,6 +23,35 @@ function lookup(repo: RepoRec): (oid: string) => GitObject | undefined {
 
 function sortedRefs(repo: RepoRec): Array<[string, string]> {
   return [...repo.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+// ------------------------------------------------------------------ response memoization
+
+// Advertisements, ls-refs and fetch replies are pure functions of the repository state and the
+// request bytes, so an identical request against an unchanged repository is served from memory
+// instead of being rebuilt. The fingerprint covers the object count and every ref target; any
+// push, edit or delete changes it and drops the whole cache for that repository.
+interface RepoCache { fp: string; ads: Map<string, Buffer>; replies: Map<string, Buffer> }
+const repoCaches = new WeakMap<RepoRec, RepoCache>();
+
+function stateFingerprint(repo: RepoRec): string {
+  let fp = String(repo.objects.size);
+  for (const [ref, oid] of sortedRefs(repo)) fp += `|${ref}=${oid}`;
+  return fp;
+}
+
+function cacheFor(repo: RepoRec): RepoCache {
+  const fp = stateFingerprint(repo);
+  let cache = repoCaches.get(repo);
+  if (!cache || cache.fp !== fp) {
+    cache = { fp, ads: new Map(), replies: new Map() };
+    repoCaches.set(repo, cache);
+  }
+  return cache;
+}
+
+function bodyKey(body: Buffer): string {
+  return createHash('sha1').update(body).digest('hex');
 }
 
 /** Peeled target of a ref value (through tag objects), or null when it is not a tag. */
@@ -40,6 +70,16 @@ function peeledOf(repo: RepoRec, oid: string): string | null {
 // ------------------------------------------------------------------ advertisements
 
 export function advertise(repo: RepoRec, service: 'git-upload-pack' | 'git-receive-pack', version2: boolean): Buffer {
+  const cache = cacheFor(repo);
+  const cacheKey = `${service}|${version2 ? 'v2' : 'v0'}`;
+  const hit = cache.ads.get(cacheKey);
+  if (hit) return hit;
+  const built = buildAdvertisement(repo, service, version2);
+  cache.ads.set(cacheKey, built);
+  return built;
+}
+
+function buildAdvertisement(repo: RepoRec, service: 'git-upload-pack' | 'git-receive-pack', version2: boolean): Buffer {
   if (service === 'git-upload-pack' && version2) {
     return Buffer.concat([
       pktLine('version 2\n'),
@@ -82,6 +122,16 @@ export function advertise(repo: RepoRec, service: 'git-upload-pack' | 'git-recei
 // ------------------------------------------------------------------ ls-refs (v2)
 
 export function lsRefs(repo: RepoRec, body: Buffer): Buffer {
+  const cache = cacheFor(repo);
+  const cacheKey = `ls:${bodyKey(body)}`;
+  const hit = cache.replies.get(cacheKey);
+  if (hit) return hit;
+  const built = buildLsRefs(repo, body);
+  cache.replies.set(cacheKey, built);
+  return built;
+}
+
+function buildLsRefs(repo: RepoRec, body: Buffer): Buffer {
   const { packets } = decodePktLines(body);
   let afterDelim = false;
   let peel = false;
@@ -246,6 +296,16 @@ function sidebandPackets(pack: Buffer): Buffer[] {
 }
 
 export function fetch(repo: RepoRec, body: Buffer, version2: boolean): Buffer {
+  const cache = cacheFor(repo);
+  const cacheKey = `fetch:${version2 ? 'v2' : 'v0'}:${bodyKey(body)}`;
+  const hit = cache.replies.get(cacheKey);
+  if (hit) return hit;
+  const built = buildFetch(repo, body, version2);
+  cache.replies.set(cacheKey, built);
+  return built;
+}
+
+function buildFetch(repo: RepoRec, body: Buffer, version2: boolean): Buffer {
   const { packets } = decodePktLines(body);
   const args: FetchArgs = { wants: [], haves: [], shallow: [], depth: null, deepenSince: null, deepenNot: [] };
   for (const packet of packets) {

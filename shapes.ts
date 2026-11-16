@@ -3,14 +3,18 @@
 
 import { Forge, VIEWER, type CommentRec, type IssueRec, type PullRec, type RepoRec } from './store.ts';
 
+// The viewer is the only user this forge ever shapes, so the object is built once and shared;
+// serializers only read it.
+const USER_SHAPE: Record<string, unknown> = {
+  login: VIEWER.login, id: VIEWER.id, type: VIEWER.type, name: VIEWER.name, email: VIEWER.email,
+  avatar_url: `https://forge.invalid/avatars/${VIEWER.id}`,
+  html_url: `https://forge.invalid/${VIEWER.login}`,
+  url: `https://forge.invalid/api/v3/users/${VIEWER.login}`,
+  site_admin: false,
+};
+
 export function userShape(): Record<string, unknown> {
-  return {
-    login: VIEWER.login, id: VIEWER.id, type: VIEWER.type, name: VIEWER.name, email: VIEWER.email,
-    avatar_url: `https://forge.invalid/avatars/${VIEWER.id}`,
-    html_url: `https://forge.invalid/${VIEWER.login}`,
-    url: `https://forge.invalid/api/v3/users/${VIEWER.login}`,
-    site_admin: false,
-  };
+  return USER_SHAPE;
 }
 
 export function repoShape(forge: Forge, repo: RepoRec): Record<string, unknown> {

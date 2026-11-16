@@ -5,7 +5,7 @@
 // repository under another owner is 404, never 403; malformed JSON is 400.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { Forge, VIEWER, type RepoRec } from './store.ts';
+import { Forge, VIEWER, type IssueRec, type PullRec, type RepoRec } from './store.ts';
 import { commentShape, issueShape, labelShape, pullShape, repoShape, userShape } from './shapes.ts';
 import { advertise, fetch as gitFetch, lsRefs, receivePack } from './gitproto.ts';
 import { parseCommit, parseTree } from './gitobj.ts';
@@ -16,7 +16,7 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 const forge = new Forge();
 let requestSeq = 0;
 
-interface Reply { status: number; body: unknown; headers?: Record<string, string> }
+interface Reply { status: number; body: unknown; headers?: Record<string, string>; raw?: Buffer }
 
 function jsonReply(status: number, body: unknown, headers: Record<string, string> = {}): Reply {
   return { status, body, headers };
@@ -30,6 +30,16 @@ function sendJson(res: ServerResponse, reply: Reply): void {
     res.end();
     return;
   }
+  if (reply.raw) {
+    res.writeHead(reply.status, {
+      'content-type': JSON_TYPE,
+      'content-length': reply.raw.length,
+      'x-github-request-id': nextRequestId(),
+      ...(reply.headers ?? {}),
+    });
+    res.end(reply.raw);
+    return;
+  }
   const text = `${JSON.stringify(reply.body)}\n`;
   res.writeHead(reply.status, {
     'content-type': JSON_TYPE,
@@ -38,6 +48,54 @@ function sendJson(res: ServerResponse, reply: Reply): void {
     ...(reply.headers ?? {}),
   });
   res.end(text);
+}
+
+// ------------------------------------------------------------------ serialized-reply cache
+
+// The hottest reads (one repository, one issue, one pull) are pure functions of fingerprinted
+// state, so their serialized bytes are memoized and repeats skip shaping and stringifying.
+// A fingerprint mismatch — any mutation of the underlying records — rebuilds the reply.
+interface CachedReply { fp: string; raw: Buffer }
+const replyCache = new Map<string, CachedReply>();
+
+function cachedJson(key: string, fp: string, make: () => Reply): Reply {
+  const hit = replyCache.get(key);
+  if (hit && hit.fp === fp) return { status: 200, body: null, raw: hit.raw };
+  const reply = make();
+  if (reply.status === 200) {
+    const raw = Buffer.from(`${JSON.stringify(reply.body)}\n`, 'utf8');
+    replyCache.set(key, { fp, raw });
+    return { ...reply, raw };
+  }
+  return reply;
+}
+
+function refsFingerprint(repo: RepoRec): string {
+  let fp = '';
+  for (const [ref, oid] of repo.refs) fp += `${ref}=${oid};`;
+  return fp;
+}
+
+function repoFingerprint(repo: RepoRec): string {
+  let open = 0;
+  for (const issue of repo.issues.values()) if (issue.state === 'open') open += 1;
+  // forge.nowIso() is the global sequence clock the shapes stamp replies with; including it keeps
+  // a cached reply from ever outliving the timestamps it was serialized with.
+  return [forge.nowIso(), repo.seq, repo.description, repo.isPrivate, repo.defaultBranch, repo.objects.size,
+    repo.issues.size, open, repo.pulls.size, refsFingerprint(repo)].join('|');
+}
+
+function issueFingerprint(repo: RepoRec, issue: IssueRec): string {
+  const labels = issue.labels.map((name) => {
+    const label = repo.labels.get(name);
+    return `${name}:${label?.color ?? ''}:${label?.description ?? ''}`;
+  }).join(',');
+  return [forge.nowIso(), issue.state, issue.title, issue.body, issue.seq, issue.comments.length, labels].join('|');
+}
+
+function pullFingerprint(repo: RepoRec, pull: PullRec): string {
+  return [forge.nowIso(), pull.state, pull.title, pull.body, pull.seq, pull.merged, pull.mergedSeq,
+    pull.mergeCommitSha ?? '', pull.headRef, pull.baseRef, refsFingerprint(repo)].join('|');
 }
 
 function nextRequestId(): string {
@@ -240,7 +298,10 @@ function repoRoute(
 ): Reply {
   void req;
   if (tail.length === 0) {
-    if (method === 'GET') return jsonReply(200, repoShape(forge, repo));
+    if (method === 'GET') {
+      return cachedJson(`repo:${repo.owner}/${repo.name}`, repoFingerprint(repo),
+        () => jsonReply(200, repoShape(forge, repo)));
+    }
     if (method === 'PATCH') {
       if (typeof body.description === 'string') repo.description = body.description;
       if (typeof body.private === 'boolean') repo.isPrivate = body.private;
@@ -462,7 +523,10 @@ function issuesRoute(repo: RepoRec, method: string, tail: string[], query: Recor
   const issue = Number.isInteger(number) ? repo.issues.get(number) : undefined;
   if (!issue) return notFound();
   if (tail.length === 1) {
-    if (method === 'GET') return jsonReply(200, issueShape(forge, repo, issue));
+    if (method === 'GET') {
+      return cachedJson(`issue:${repo.owner}/${repo.name}:${issue.number}`, issueFingerprint(repo, issue),
+        () => jsonReply(200, issueShape(forge, repo, issue)));
+    }
     if (method === 'PATCH') {
       if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
       if (typeof body.title === 'string') issue.title = body.title;
@@ -535,7 +599,10 @@ function pullsRoute(repo: RepoRec, method: string, tail: string[], query: Record
   const pull = Number.isInteger(number) ? repo.pulls.get(number) : undefined;
   if (!pull) return notFound();
   if (tail.length === 1) {
-    if (method === 'GET') return jsonReply(200, pullShape(forge, repo, pull));
+    if (method === 'GET') {
+      return cachedJson(`pull:${repo.owner}/${repo.name}:${pull.number}`, pullFingerprint(repo, pull),
+        () => jsonReply(200, pullShape(forge, repo, pull)));
+    }
     if (method === 'PATCH') {
       if (body.state === 'open' || body.state === 'closed') pull.state = body.state;
       if (typeof body.title === 'string') pull.title = body.title;
@@ -613,7 +680,7 @@ function firstPktLine(body: Buffer): string {
 // ------------------------------------------------------------------ the server
 
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
         const rawBody = await readBody(req);
@@ -676,4 +743,9 @@ export function createApp(): Server {
       }
     })();
   });
+  // Loopback benchmarks notice TCP delay more than anything else: no Nagle, long keep-alive.
+  server.on('connection', (socket) => { socket.setNoDelay(true); });
+  server.keepAliveTimeout = 75_000;
+  server.headersTimeout = 80_000;
+  return server;
 }
