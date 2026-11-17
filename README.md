@@ -1,5 +1,9 @@
 # github-forge-v2
 
+[![make.fun bounty](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/cocotvoros/github-forge-v2/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard)
+[![reward](https://make.fun/badge/github-core-clone-01/cocotvoros/github-forge-v2/reward.svg)](https://make.fun/bounty/github-core-clone-01)
+
 A complete GitHub-compatible git forge in one Node process, standard library only: git smart
 HTTP (protocol v2 and v0) for clone/fetch/push, the REST v3 API for repositories, contents,
 issues and pull requests, the GraphQL v4 API, and an MCP endpoint — all over one in-memory,
